@@ -1,0 +1,128 @@
+name: Verify and Publish Distribution
+
+on:
+  repository_dispatch:
+    types: [publish-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Uploaded distribution draft tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      source_sha:
+        description: Source commit recorded by the private build workflow
+        required: true
+        type: string
+      asset_kind:
+        description: Source release assets to distribute
+        required: true
+        default: archives
+        type: choice
+        options: [archives, binaries]
+      linux_sha256:
+        description: Expected SHA-256 of the Linux file, from the private build
+        required: true
+        type: string
+      windows_sha256:
+        description: Expected SHA-256 of the Windows file, from the private build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-${{ inputs.tag || github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'diseq/vault-agent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.client_payload.source_sha }}
+      ASSET_KIND: ${{ inputs.asset_kind || github.event.client_payload.asset_kind }}
+      LINUX_SHA256: ${{ inputs.linux_sha256 || github.event.client_payload.linux_sha256 }}
+      WINDOWS_SHA256: ${{ inputs.windows_sha256 || github.event.client_payload.windows_sha256 }}
+    steps:
+      - name: Validate Distribution Request
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ || ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::A release tag and full lowercase source commit SHA are required.'
+            exit 1
+          fi
+          if [[ "$ASSET_KIND" != archives && "$ASSET_KIND" != binaries ]]; then
+            echo '::error::asset_kind must be archives or binaries.'
+            exit 1
+          fi
+          if [[ ! "$LINUX_SHA256" =~ ^[0-9a-f]{64}$ || ! "$WINDOWS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo '::error::Both build-file SHA-256 digests are required.'
+            exit 1
+          fi
+          if [[ $(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft') != true ]]; then
+            echo '::error::Only an existing distribution draft can be published.'
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            echo 'PRERELEASE=true' >> "$GITHUB_ENV"
+          else
+            echo 'PRERELEASE=false' >> "$GITHUB_ENV"
+          fi
+      - name: Download and Verify Pushed Builds
+        run: |
+          set -euo pipefail
+          case "$ASSET_KIND" in
+            archives)
+              assets=(vault-agent-linux-amd64.tar.gz vault-agent-windows-amd64.zip)
+              ;;
+            binaries)
+              assets=(vault-agent vault-agent.exe)
+              ;;
+          esac
+          gh release view "$RELEASE_TAG" --json assets \
+            | jq -e --arg linux "${assets[0]}" --arg windows "${assets[1]}" \
+              'all(.assets[]; .name == $linux or .name == $windows or .name == "SOURCE.json" or .name == "CHECKSUMS.sha256")'
+          mkdir -p dist
+          for asset in "${assets[@]}"; do
+            gh release download "$RELEASE_TAG" --pattern "$asset" --dir dist
+          done
+          printf '%s  %s\n' "$LINUX_SHA256" "${assets[0]}" "$WINDOWS_SHA256" "${assets[1]}" \
+            | (cd dist && sha256sum --check --strict -)
+          jq -n --arg repository 'plutowork/vault-agent' --arg tag "$RELEASE_TAG" \
+            --arg commit "$SOURCE_SHA" --arg asset_kind "$ASSET_KIND" \
+            --arg linux_sha256 "$LINUX_SHA256" --arg windows_sha256 "$WINDOWS_SHA256" \
+            '{source_repository: $repository, source_tag: $tag, source_commit: $commit,
+              asset_kind: $asset_kind, linux_sha256: $linux_sha256, windows_sha256: $windows_sha256,
+              verification: "SHA-256 checked against the authenticated publish request; private source was not accessed"}' > dist/SOURCE.json
+          (cd dist && sha256sum "${assets[@]}" SOURCE.json) > dist/CHECKSUMS.sha256
+      - name: Attest Verified Distribution
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*
+      - name: Publish Complete Distribution Release
+        run: |
+          set -euo pipefail
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
+            if [[ "$draft" != true ]]; then
+              echo '::error::Refusing to modify a published distribution release. Use a new version.'
+              exit 1
+            fi
+          else
+            echo '::error::Distribution draft is missing; upload both platforms from the private build first.'
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" \
+            --notes "Attested distribution of private source commit $SOURCE_SHA. Both files were checked against the authenticated publisher request. See SOURCE.json; this workflow does not access or independently verify the private source build."
