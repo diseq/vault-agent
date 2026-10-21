@@ -100,10 +100,10 @@ jobs:
           done
           printf '%s  %s\n' "$LINUX_SHA256" "${assets[0]}" "$WINDOWS_SHA256" "${assets[1]}" \
             | (cd dist && sha256sum --check --strict -)
-          jq -n --arg repository 'plutowork/vault-agent' --arg tag "$RELEASE_TAG" \
+          jq -n --arg tag "$RELEASE_TAG" \
             --arg commit "$SOURCE_SHA" --arg asset_kind "$ASSET_KIND" \
             --arg linux_sha256 "$LINUX_SHA256" --arg windows_sha256 "$WINDOWS_SHA256" \
-            '{source_repository: $repository, source_tag: $tag, source_commit: $commit,
+            '{source_tag: $tag, source_commit: $commit,
               asset_kind: $asset_kind, linux_sha256: $linux_sha256, windows_sha256: $windows_sha256,
               verification: "SHA-256 checked against the authenticated publish request; private source was not accessed"}' > dist/SOURCE.json
           (cd dist && sha256sum "${assets[@]}" SOURCE.json) > dist/CHECKSUMS.sha256
